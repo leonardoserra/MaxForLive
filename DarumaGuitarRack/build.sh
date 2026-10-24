@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Builds DarumaGuitarRack.amxd (+ .maxpat) from DarumaGuitarRack.genexpr
-# Same output as build.ps1, for macOS/Linux (bash or zsh). Keep the two in sync.
-# Usage: ./build.sh   (or: bash build.sh / zsh build.sh)
+# Usage: ./build.sh   (bash or zsh on macOS/Linux, Git Bash on Windows)
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 device_name=DarumaGuitarRack
