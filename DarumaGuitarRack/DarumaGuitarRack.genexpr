@@ -1,0 +1,475 @@
+// Daruma Guitar Rack - gen~ DSP core
+// Chain: gate detect -> tight HP -> mode voicing -> oversampled clipper -> DC block
+//        -> tone LP -> 3-band EQ -> cab sim -> gate -> dry/wet -> volume
+//        -> glue compressor -> static chorus -> spring reverb
+// Modes: 0 Clean, 1 Overdrive, 2 Distortion, 3 Fuzz, 4 Metal
+// Cab:   0 Off, 1 1x12, 2 2x12, 3 4x12
+// OS:    0 1x, 1 2x, 2 4x, 3 8x
+
+// ---------- RBJ biquad coefficient helpers (return b0, b1, b2, a1, a2) ----------
+cf_lp(f, q, fs) {
+	w = twopi * clamp(f, 10, fs * 0.49) / fs;
+	cw = cos(w);
+	al = sin(w) / (2 * q);
+	a0 = 1 + al;
+	b0 = (1 - cw) * 0.5 / a0;
+	return b0, 2 * b0, b0, -2 * cw / a0, (1 - al) / a0;
+}
+
+cf_hp(f, q, fs) {
+	w = twopi * clamp(f, 10, fs * 0.49) / fs;
+	cw = cos(w);
+	al = sin(w) / (2 * q);
+	a0 = 1 + al;
+	b0 = (1 + cw) * 0.5 / a0;
+	return b0, -2 * b0, b0, -2 * cw / a0, (1 - al) / a0;
+}
+
+cf_pk(f, q, gdb, fs) {
+	A = pow(10, gdb / 40);
+	w = twopi * clamp(f, 10, fs * 0.49) / fs;
+	cw = cos(w);
+	al = sin(w) / (2 * q);
+	a0 = 1 + al / A;
+	return (1 + al * A) / a0, -2 * cw / a0, (1 - al * A) / a0, -2 * cw / a0, (1 - al / A) / a0;
+}
+
+cf_ls(f, gdb, fs) {
+	A = pow(10, gdb / 40);
+	w = twopi * clamp(f, 10, fs * 0.49) / fs;
+	cw = cos(w);
+	sa = sqrt(A) * sin(w) * sqrt(2);
+	a0 = (A + 1) + (A - 1) * cw + sa;
+	return A * ((A + 1) - (A - 1) * cw + sa) / a0, 2 * A * ((A - 1) - (A + 1) * cw) / a0, A * ((A + 1) - (A - 1) * cw - sa) / a0, -2 * ((A - 1) + (A + 1) * cw) / a0, ((A + 1) + (A - 1) * cw - sa) / a0;
+}
+
+cf_hs(f, gdb, fs) {
+	A = pow(10, gdb / 40);
+	w = twopi * clamp(f, 10, fs * 0.49) / fs;
+	cw = cos(w);
+	sa = sqrt(A) * sin(w) * sqrt(2);
+	a0 = (A + 1) - (A - 1) * cw + sa;
+	return A * ((A + 1) + (A - 1) * cw + sa) / a0, -2 * A * ((A - 1) + (A + 1) * cw) / a0, A * ((A + 1) + (A - 1) * cw - sa) / a0, 2 * ((A - 1) - (A + 1) * cw) / a0, ((A + 1) - (A - 1) * cw - sa) / a0;
+}
+
+// transposed direct form II biquad tick: returns output and the two new states
+bq(x, b0, b1, b2, a1, a2, s1, s2) {
+	y = b0 * x + s1;
+	n1 = fixdenorm(b1 * x - a1 * y + s2);
+	n2 = fixdenorm(b2 * x - a2 * y);
+	return y, n1, n2;
+}
+
+// ---------- parameters ----------
+Param mode(1, min=0, max=4);
+Param drive(50, min=0, max=150);
+Param tone(55, min=0, max=100);
+Param volume(-6, min=-36, max=12);
+Param bass(0, min=-12, max=12);
+Param middle(0, min=-12, max=12);
+Param treble(0, min=-12, max=12);
+Param drywet(100, min=0, max=100);
+Param tight(30, min=0, max=100);
+Param gatethr(-80, min=-80, max=-20);
+Param cabtype(3, min=0, max=3);
+Param oversamp(2, min=0, max=3);
+Param chodepth(100, min=0, max=200);
+Param chospread(4, min=0.5, max=12);
+Param chomix(0, min=0, max=100);
+Param spdecay(2500, min=300, max=10000);   // reverb decay time (RT60) in ms
+Param sptone(50, min=0, max=100);
+Param spmix(0, min=0, max=100);
+Param spsize(30, min=0, max=100);
+Param compthr(-10, min=-40, max=0);
+Param comprat(1, min=0, max=2);       // 0 = 2:1, 1 = 4:1, 2 = 10:1
+Param compatk(3, min=0.1, max=30);    // ms
+Param comprel(300, min=50, max=1200); // ms
+Param compmake(3, min=0, max=20);     // dB
+Param compmix(100, min=0, max=100);
+// section on/off switches (AMP is always on)
+Param eqon(1, min=0, max=1);
+Param shapeon(1, min=0, max=1);
+Param compon(1, min=0, max=1);
+Param choon(1, min=0, max=1);
+Param spon(1, min=0, max=1);
+
+// ---------- state ----------
+History s_drive(0.5); History s_tone(0.55); History s_vol(0.5); History s_mix(1);
+History s_tight(0.3); History s_bass(0); History s_mid(0); History s_treb(0);
+History h_genv(0); History h_gopen(1); History h_ggain(1);
+History h_t1(0); History h_t2(0);
+History h_p1(0); History h_p2(0);
+History h_xprev(0);
+History h_su1(0); History h_su2(0); History h_su3(0); History h_su4(0);
+History h_sd1(0); History h_sd2(0); History h_sd3(0); History h_sd4(0);
+History h_ms(0);
+History h_dcx(0); History h_dcy(0);
+History h_n1(0); History h_n2(0);
+History h_l1(0); History h_l2(0);
+History h_m1(0); History h_m2(0);
+History h_h1(0); History h_h2(0);
+History h_c11(0); History h_c12(0); History h_c21(0); History h_c22(0);
+History h_c31(0); History h_c32(0); History h_c41(0); History h_c42(0);
+History h_c51(0); History h_c52(0); History h_c61(0); History h_c62(0);
+History s_cdep(1); History s_cspr(4); History s_cmx(0);
+History s_sdec(2.5); History s_ston(0.5); History s_smx(0);
+History h_sp1(0); History h_sp2(0); History h_sp3(0); History h_sp4(0);
+History h_lp1(0); History h_lp2(0); History h_lp3(0); History h_lp4(0);
+History s_ssz(0.3); History h_cenv(0); History s_cmk(1.4125);
+History s_cpm(1); History s_eqs(1); History s_shp(1); History s_cps(1); History s_chs(1); History s_sps(1);
+Delay cdl(8192);
+Delay pd1(12000);
+Delay pd2(12000);
+Delay sdl1(40000);
+Delay sdl2(40000);
+Delay sdl3(40000);
+Delay sdl4(40000);
+Data ap(64);
+
+
+// ---------- parameter smoothing ----------
+sk = 1 - exp(-1 / (0.03 * samplerate));
+drv = s_drive + (drive * 0.01 - s_drive) * sk;  s_drive = drv;
+ton = s_tone + (tone * 0.01 - s_tone) * sk;     s_tone = ton;
+vol = s_vol + (dbtoa(volume) - s_vol) * sk;     s_vol = vol;
+mx = s_mix + (drywet * 0.01 - s_mix) * sk;      s_mix = mx;
+tgt = s_tight + (tight * 0.01 - s_tight) * sk;  s_tight = tgt;
+bas = s_bass + (bass - s_bass) * sk;            s_bass = bas;
+mdl = s_mid + (middle - s_mid) * sk;            s_mid = mdl;
+tre = s_treb + (treble - s_treb) * sk;          s_treb = tre;
+cdep = s_cdep + (chodepth * 0.01 - s_cdep) * sk; s_cdep = cdep;
+cspr = s_cspr + (chospread - s_cspr) * sk;       s_cspr = cspr;
+cmx = s_cmx + (chomix * 0.01 - s_cmx) * sk;      s_cmx = cmx;
+sdec = s_sdec + (spdecay * 0.001 - s_sdec) * sk;  s_sdec = sdec;
+ston = s_ston + (sptone * 0.01 - s_ston) * sk;   s_ston = ston;
+smx = s_smx + (spmix * 0.01 - s_smx) * sk;       s_smx = smx;
+cpm = s_cpm + (compmix * 0.01 - s_cpm) * sk;     s_cpm = cpm;
+eqs = s_eqs + (eqon - s_eqs) * sk;               s_eqs = eqs;
+shp = s_shp + (shapeon - s_shp) * sk;            s_shp = shp;
+cps = s_cps + (compon - s_cps) * sk;             s_cps = cps;
+chs = s_chs + (choon - s_chs) * sk;              s_chs = chs;
+sps = s_sps + (spon - s_sps) * sk;               s_sps = sps;
+
+m = floor(clamp(mode, 0, 4) + 0.5);
+
+// guitar is mono: sum the two channels
+x = (in1 + in2) * 0.5;
+dry = x;
+
+// ---------- noise gate detector (on the clean input) ----------
+ax = abs(x);
+ea = 1 - exp(-1 / (0.0005 * samplerate));
+er = 1 - exp(-1 / (0.03 * samplerate));
+genv = h_genv + (ax - h_genv) * ((ax > h_genv) ? ea : er);
+h_genv = genv;
+thr = dbtoa(gatethr);
+gopen = h_gopen;
+if (gatethr <= -79.5) {
+	gopen = 1;
+}
+else if (genv > thr) {
+	gopen = 1;
+}
+else if (genv < thr * 0.5) {
+	gopen = 0;
+}
+h_gopen = gopen;
+ga = 1 - exp(-1 / (0.001 * samplerate));
+gr = 1 - exp(-1 / (0.08 * samplerate));
+ggain = h_ggain + (gopen - h_ggain) * ((gopen > h_ggain) ? ga : gr);
+h_ggain = ggain;
+
+// ---------- tight: pre-drive high-pass 20..400 Hz ----------
+b0, b1, b2, a1, a2 = cf_hp(20 * pow(20, tgt), 0.707, samplerate);
+y, n1, n2 = bq(x, b0, b1, b2, a1, a2, h_t1, h_t2);
+h_t1 = n1; h_t2 = n2;
+y = x + (y - x) * shp;   // SHAPE off -> no tight filter
+
+// ---------- mode voicing + gain ----------
+vf = 720; vq = 0.8; vg = 6; gain = 1;
+if (m == 0) {
+	vf = 2000; vq = 0.7; vg = 2; gain = dbtoa(6 + drv * 30);
+}
+else if (m == 1) {
+	vf = 720; vq = 0.8; vg = 6; gain = dbtoa(drv * 40);
+}
+else if (m == 2) {
+	vf = 1000; vq = 0.7; vg = 3; gain = dbtoa(6 + drv * 42);
+}
+else if (m == 3) {
+	vf = 450; vq = 0.5; vg = 2; gain = dbtoa(10 + drv * 46);
+}
+else {
+	vf = 1400; vq = 0.9; vg = 7; gain = dbtoa(14 + drv * 52);
+}
+b0, b1, b2, a1, a2 = cf_pk(vf, vq, vg, samplerate);
+y, n1, n2 = bq(y, b0, b1, b2, a1, a2, h_p1, h_p2);
+h_p1 = n1; h_p2 = n2;
+
+// ---------- oversampled clipper ----------
+osf = 1;
+if (oversamp > 2.5) {
+	osf = 8;
+}
+else if (oversamp > 1.5) {
+	osf = 4;
+}
+else if (oversamp > 0.5) {
+	osf = 2;
+}
+ofs = samplerate * osf;
+// 4th-order Butterworth anti-alias low-pass (two sections) at 0.45 * base rate
+ab0, ab1, ab2, aa1, aa2 = cf_lp(samplerate * 0.45, 0.5412, ofs);
+bb0, bb1, bb2, ba1, ba2 = cf_lp(samplerate * 0.45, 1.3066, ofs);
+kms = 1 - exp(-twopi * 250 / ofs);
+g2 = sqrt(gain);
+
+su1 = h_su1; su2 = h_su2; su3 = h_su3; su4 = h_su4;
+sd1 = h_sd1; sd2 = h_sd2; sd3 = h_sd3; sd4 = h_sd4;
+ms = h_ms;
+xp = h_xprev;
+xi = 0; u = 0; c = 0; s1 = 0; z = 0; yo = 0;
+
+for (i = 0; i < osf; i += 1) {
+	// linear-interpolated upsample + anti-image filter
+	xi = xp + (y - xp) * ((i + 1) / osf);
+	if (osf > 1) {
+		xi, su1, su2 = bq(xi, ab0, ab1, ab2, aa1, aa2, su1, su2);
+		xi, su3, su4 = bq(xi, bb0, bb1, bb2, ba1, ba2, su3, su4);
+	}
+
+	u = xi * gain;
+	if (m == 0) {
+		// clean: lots of headroom, Drive mostly raises level, breaks up gently when pushed
+		z = tanh(u * 0.3) * 0.75;
+	}
+	else if (m == 1) {
+		// overdrive: smooth, slightly asymmetric tanh
+		z = (tanh(u + 0.1) - 0.0997) * 0.8;
+	}
+	else if (m == 2) {
+		// distortion: biased cubic clipper, harder knee
+		c = clamp(u * 0.7 + 0.15, -1, 1);
+		z = (1.5 * (c - c * c * c / 3) - 0.2233) * 0.75;
+	}
+	else if (m == 3) {
+		// fuzz: starved, asymmetric hard clip
+		c = clamp(u + 0.25, -0.8, 1);
+		z = tanh(2.5 * c) * 0.6;
+	}
+	else {
+		// metal: two cascaded stages with an interstage high-pass
+		s1 = tanh(xi * g2);
+		ms = ms + (s1 - ms) * kms;
+		z = tanh((s1 - ms) * g2 * 1.5 + 0.05) * 0.6;
+	}
+
+	// anti-alias filter before decimation
+	if (osf > 1) {
+		z, sd1, sd2 = bq(z, ab0, ab1, ab2, aa1, aa2, sd1, sd2);
+		z, sd3, sd4 = bq(z, bb0, bb1, bb2, ba1, ba2, sd3, sd4);
+	}
+	yo = z;
+}
+
+h_su1 = su1; h_su2 = su2; h_su3 = su3; h_su4 = su4;
+h_sd1 = sd1; h_sd2 = sd2; h_sd3 = sd3; h_sd4 = sd4;
+h_ms = fixdenorm(ms);
+h_xprev = y;
+
+// ---------- DC blocker (asymmetric clipping adds DC) ----------
+dcy = yo - h_dcx + 0.9995 * h_dcy;
+h_dcx = yo;
+h_dcy = fixdenorm(dcy);
+w = dcy;
+
+// ---------- tone: low-pass 1k..12k ----------
+b0, b1, b2, a1, a2 = cf_lp(1000 * pow(12, ton), 0.707, samplerate);
+w, n1, n2 = bq(w, b0, b1, b2, a1, a2, h_n1, h_n2);
+h_n1 = n1; h_n2 = n2;
+
+// ---------- 3-band EQ ----------
+weq = w;
+b0, b1, b2, a1, a2 = cf_ls(120, bas, samplerate);
+w, n1, n2 = bq(w, b0, b1, b2, a1, a2, h_l1, h_l2);
+h_l1 = n1; h_l2 = n2;
+b0, b1, b2, a1, a2 = cf_pk(800, 0.8, mdl, samplerate);
+w, n1, n2 = bq(w, b0, b1, b2, a1, a2, h_m1, h_m2);
+h_m1 = n1; h_m2 = n2;
+b0, b1, b2, a1, a2 = cf_hs(3200, tre, samplerate);
+w, n1, n2 = bq(w, b0, b1, b2, a1, a2, h_h1, h_h2);
+h_h1 = n1; h_h2 = n2;
+w = weq + (w - weq) * eqs;   // EQ off -> flat
+
+// ---------- cabinet simulation ----------
+ct = floor(clamp(cabtype, 0, 3) + 0.5);
+if (ct > 0) {
+	// default: 1x12 open-back combo (brighter, less thump)
+	f1 = 75;   q1 = 0.8;
+	f2 = 130;  q2 = 1.2; k2 = 2;
+	f3 = 450;  q3 = 1.0; k3 = -2;
+	f4 = 2500; q4 = 1.2; k4 = 4;
+	f5 = 5800; q5 = 0.9;
+	f6 = 7500; q6 = 0.6;
+	if (ct == 2) {
+		// 2x12: fuller lows, scooped low-mids
+		f1 = 85;   q1 = 0.9;
+		f2 = 110;  q2 = 1.4; k2 = 3;
+		f3 = 500;  q3 = 0.9; k3 = -3.5;
+		f4 = 2200; q4 = 1.1; k4 = 3.5;
+		f5 = 5200; q5 = 0.85;
+		f6 = 6800; q6 = 0.6;
+	}
+	else if (ct == 3) {
+		// 4x12 closed-back: resonant thump, dark top
+		f1 = 70;   q1 = 1.1;
+		f2 = 100;  q2 = 1.5; k2 = 4.5;
+		f3 = 400;  q3 = 0.8; k3 = -5;
+		f4 = 1900; q4 = 1.0; k4 = 4;
+		f5 = 4600; q5 = 0.9;
+		f6 = 6000; q6 = 0.6;
+	}
+	b0, b1, b2, a1, a2 = cf_hp(f1, q1, samplerate);
+	w, n1, n2 = bq(w, b0, b1, b2, a1, a2, h_c11, h_c12);
+	h_c11 = n1; h_c12 = n2;
+	b0, b1, b2, a1, a2 = cf_pk(f2, q2, k2, samplerate);
+	w, n1, n2 = bq(w, b0, b1, b2, a1, a2, h_c21, h_c22);
+	h_c21 = n1; h_c22 = n2;
+	b0, b1, b2, a1, a2 = cf_pk(f3, q3, k3, samplerate);
+	w, n1, n2 = bq(w, b0, b1, b2, a1, a2, h_c31, h_c32);
+	h_c31 = n1; h_c32 = n2;
+	b0, b1, b2, a1, a2 = cf_pk(f4, q4, k4, samplerate);
+	w, n1, n2 = bq(w, b0, b1, b2, a1, a2, h_c41, h_c42);
+	h_c41 = n1; h_c42 = n2;
+	b0, b1, b2, a1, a2 = cf_lp(f5, q5, samplerate);
+	w, n1, n2 = bq(w, b0, b1, b2, a1, a2, h_c51, h_c52);
+	h_c51 = n1; h_c52 = n2;
+	b0, b1, b2, a1, a2 = cf_lp(f6, q6, samplerate);
+	w, n1, n2 = bq(w, b0, b1, b2, a1, a2, h_c61, h_c62);
+	h_c61 = n1; h_c62 = n2;
+	w = w * 1.4;
+}
+
+// ---------- gate, distortion mix ----------
+w = w * (1 + (ggain - 1) * shp) * vol;   // SHAPE off -> no gate
+o = w * mx + dry * (1 - mx);
+
+// ---------- glue compressor: feed-forward, 6 dB soft knee, smoothing in dB ----------
+crat = 4;
+if (comprat < 0.5) {
+	crat = 2;
+}
+else if (comprat > 1.5) {
+	crat = 10;
+}
+ov = atodb(max(abs(o), 0.000001)) - compthr;
+grt = 0;
+if (ov >= 3) {
+	grt = ov * (1 - 1 / crat);
+}
+else if (ov > -3) {
+	grt = (1 - 1 / crat) * (ov + 3) * (ov + 3) / 12;
+}
+catk = 1 - exp(-1 / (compatk * 0.001 * samplerate));
+crel = 1 - exp(-1 / (comprel * 0.001 * samplerate));
+cenv = h_cenv + (grt - h_cenv) * ((grt > h_cenv) ? catk : crel);
+h_cenv = fixdenorm(cenv);
+cmk = s_cmk + (dbtoa(compmake) - s_cmk) * sk;
+s_cmk = cmk;
+oc = o * dbtoa(-cenv) * cmk;
+o = o + (oc - o) * cpm * cps;   // comp dry/wet, then on/off
+
+// ---------- static chorus: fixed delay voices, no LFO ----------
+// voice 1 left, voice 2 right, voice 3 centre; Spread sets the spacing between them
+sms = samplerate * 0.001;
+cdl.write(o);
+d1 = cdl.read((7) * sms);
+d2 = cdl.read((7 + cspr) * sms);
+d3 = cdl.read((7 + 2 * cspr) * sms);
+// Mix and Depth together set how loud the voices are vs the dry signal (up to 3:1)
+ck = cmx * cdep;
+cl = (o + ck * (d1 + 0.5 * d3)) / (1 + ck * 0.75);
+cr = (o + ck * (d2 + 0.5 * d3)) / (1 + ck * 0.75);
+cl = o + (cl - o) * chs;
+cr = o + (cr - o) * chs;
+
+// ---------- spring reverb: 4 dispersive loops, Hadamard mixed ----------
+// Size scales the loops and adds diffusion: spring -> room -> hall, keeping the spring chirp
+spin = (cl + cr) * 0.5;
+b0, b1, b2, a1, a2 = cf_hp(150, 0.707, samplerate);
+spin, n1, n2 = bq(spin, b0, b1, b2, a1, a2, h_sp1, h_sp2);
+h_sp1 = n1; h_sp2 = n2;
+b0, b1, b2, a1, a2 = cf_lp(5000, 0.707, samplerate);
+spin, n1, n2 = bq(spin, b0, b1, b2, a1, a2, h_sp3, h_sp4);
+h_sp3 = n1; h_sp4 = n2;
+
+// size is smoothed slowly so turning it does not warble
+ssz = s_ssz + (spsize * 0.01 - s_ssz) * (1 - exp(-1 / (0.2 * samplerate)));
+s_ssz = ssz;
+scl = 1 + 2.5 * ssz;
+dif = 0.7 * ssz;
+
+// two Schroeder allpass diffusers (pure short pre-delay when Size = 0)
+tp = pd1.read(4.7 * scl * sms);
+wv = spin + dif * tp;
+pd1.write(wv);
+spin = tp - dif * wv;
+tp = pd2.read(11.3 * scl * sms);
+wv = spin + dif * tp;
+pd2.write(wv);
+spin = tp - dif * wv;
+
+// loop lengths (s) and feedback gain so each loop falls 60 dB in sdec seconds
+len1 = 0.0337 * scl; len2 = 0.0413 * scl; len3 = 0.0479 * scl; len4 = 0.0551 * scl;
+g1 = min(pow(10, -3 * len1 / sdec), 0.995);
+g2l = min(pow(10, -3 * len2 / sdec), 0.995);
+g3 = min(pow(10, -3 * len3 / sdec), 0.995);
+g4 = min(pow(10, -3 * len4 / sdec), 0.995);
+dampk = 1 - exp(-twopi * 1500 * pow(5, ston) / samplerate);
+apc = 0.6;
+st = 0; yy = 0;
+
+r1 = sdl1.read(len1 * samplerate);
+r2 = sdl2.read(len2 * samplerate);
+r3 = sdl3.read(len3 * samplerate);
+r4 = sdl4.read(len4 * samplerate);
+
+// spring dispersion: 12 first-order allpasses per loop
+for (j = 0; j < 12; j += 1) {
+	st = peek(ap, j);
+	yy = apc * r1 + st;
+	poke(ap, fixdenorm(r1 - apc * yy), j);
+	r1 = yy;
+	st = peek(ap, j + 16);
+	yy = apc * r2 + st;
+	poke(ap, fixdenorm(r2 - apc * yy), j + 16);
+	r2 = yy;
+	st = peek(ap, j + 32);
+	yy = apc * r3 + st;
+	poke(ap, fixdenorm(r3 - apc * yy), j + 32);
+	r3 = yy;
+	st = peek(ap, j + 48);
+	yy = apc * r4 + st;
+	poke(ap, fixdenorm(r4 - apc * yy), j + 48);
+	r4 = yy;
+}
+
+// damping (Spring Tone)
+l1 = h_lp1 + (r1 - h_lp1) * dampk; h_lp1 = fixdenorm(l1);
+l2 = h_lp2 + (r2 - h_lp2) * dampk; h_lp2 = fixdenorm(l2);
+l3 = h_lp3 + (r3 - h_lp3) * dampk; h_lp3 = fixdenorm(l3);
+l4 = h_lp4 + (r4 - h_lp4) * dampk; h_lp4 = fixdenorm(l4);
+
+// Hadamard feedback mix (energy preserving)
+v1 = l1 * g1; v2 = l2 * g2l; v3 = l3 * g3; v4 = l4 * g4;
+sdl1.write(spin * 0.5 + 0.5 * (v1 + v2 + v3 + v4));
+sdl2.write(spin * 0.5 + 0.5 * (v1 - v2 + v3 - v4));
+sdl3.write(spin * 0.5 + 0.5 * (v1 + v2 - v3 - v4));
+sdl4.write(spin * 0.5 + 0.5 * (v1 - v2 - v3 + v4));
+
+revl = (l1 + l3) * 1.2;
+revr = (l2 + l4) * 1.2;
+
+smxe = smx * sps;   // SPRING off -> dry
+out1 = cl * (1 - smxe) + revl * smxe;
+out2 = cr * (1 - smxe) + revr * smxe;
