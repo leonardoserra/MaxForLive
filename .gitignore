@@ -1,0 +1,6 @@
+# Build output: build.ps1 regenerates it (same patcher JSON as inside the .amxd)
+*.maxpat
+
+# OS files
+.DS_Store
+Thumbs.db

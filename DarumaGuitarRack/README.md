@@ -2,6 +2,8 @@
 
 Max for Live audio effect for electric guitar (Live 11 / Max 8), DSP written in gen~.
 
+![Daruma Guitar Rack](image.png)
+
 Chain: Gate -> Tight -> Distortion (4 modes, oversampled) -> Tone -> EQ -> Cab -> Glue Compressor -> Static Chorus -> Spring Reverb
 
 ## Install
@@ -39,5 +41,5 @@ Input is summed to mono; the chorus and spring spread the output to stereo.
 
 ## Editing
 - DSP: `DarumaGuitarRack.genexpr` (same code as the codebox inside the device's gen~).
-- UI/patch: `build.ps1` generates the patcher.
+- UI/patch: `build.ps1` generates the patcher (`.amxd`, plus a `.maxpat` copy that is not committed).
 - Rebuild: `powershell -ExecutionPolicy Bypass -File build.ps1`
