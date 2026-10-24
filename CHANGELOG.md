@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## 0.6.1 - 2026-10-24
+
+- Changed
+  - The repo has a README that lists the devices, each with a screenshot and a link to its docs, and explains how to
+    use a device in Live and how to build one.
+  - Daruma Guitar Rack's README shows a screenshot of the device.
+  - The device is built with `build.sh` on every machine: bash or zsh on macOS/Linux, Git Bash on Windows.
+    `DarumaGuitarRack.amxd` is rebuilt with it and works the same in Live; the file is 47 KB instead of 281 KB.
+- Removed
+  - `build.ps1`, replaced by `build.sh`.
+  - `DarumaGuitarRack.maxpat` from the repo. The build still writes it, but git ignores it.
+
 ## 0.6.0 - 2026-10-24
 
 - Changed
