@@ -41,5 +41,7 @@ Input is summed to mono; the chorus and spring spread the output to stereo.
 
 ## Editing
 - DSP: `DarumaGuitarRack.genexpr` (same code as the codebox inside the device's gen~).
-- UI/patch: `build.ps1` generates the patcher (`.amxd`, plus a `.maxpat` copy that is not committed).
-- Rebuild: `powershell -ExecutionPolicy Bypass -File build.ps1`
+- UI/patch: `build.sh` / `build.ps1` generate the patcher (`.amxd`, plus a `.maxpat` copy that is not committed).
+  The two scripts build the same device: a UI change goes in both.
+- Rebuild on macOS / Linux (bash or zsh): `./build.sh`
+- Rebuild on Windows: `powershell -ExecutionPolicy Bypass -File build.ps1`

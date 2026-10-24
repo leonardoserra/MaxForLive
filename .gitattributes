@@ -1,0 +1,2 @@
+# Shell scripts must keep LF, or bash/zsh fail on the \r (also in Git Bash on Windows)
+*.sh text eol=lf
